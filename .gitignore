@@ -3,7 +3,8 @@
 .devcontainer
 .vscode/
 build/
-sdkconfig
+sdkconfig.old
+sdkconfig.defaults
 .DS_Store
 Thumbs.db
 desktop.ini
