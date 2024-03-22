@@ -1,0 +1,5 @@
+[*.{h,c}]
+charset = cp1252
+indent_size = 4
+indent_style = tab
+end_of_line = lf
