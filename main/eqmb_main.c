@@ -335,30 +335,36 @@ static void eqmb_ragebtn_gpio_task(void *arg)
 {
 	int64_t last_rage_time = 0, now = 0;
 	uint8_t act_streak = 0;
-	uint8_t buffer[] = {HID_KEY_FWD_SLASH};
+	uint8_t key_buf[] = {HID_KEY_FWD_SLASH};
 	while (1)
 	{
 		if (xQueueReceive(eqmb_ragebtn_gpio_queue, NULL, portMAX_DELAY))
 		{
-			if (eqmb_connected)
+			if (!eqmb_connected)
+				continue;
+
+			now = esp_timer_get_time();
+			// 750ms grace period for 'rage mode', considering the agility
+			// stat of the certain professor
+			if (now - last_rage_time < 750000)
 			{
-				now = esp_timer_get_time();
-				if (now - last_rage_time < 750000)
-				{
-					ESP_LOGI(TAG, "RAGE BUTTON STREAK!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-					act_streak += (act_streak < 5) ? 1 : 0; // max 5, for 6 chars
-				}
-				else
-				{
-					// a little bit of boring here, tbh
-					ESP_LOGI(TAG, "RAGE BUTTON PRESSED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-					act_streak = 0;
-				}
-				last_rage_time = now;
-				// 0x02 = LSHIFT modifier
-				for (int i = 0; i <= act_streak; i++)
-					esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, buffer, 1);
-				esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, buffer, 0);
+				// this is exiciting!
+				ESP_LOGI(TAG, "RAGE BUTTON STREAK!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+				act_streak += (act_streak < 5) ? 1 : 0; // max 5, for 6 chars
+			}
+			else
+			{
+				// a little bit of boring here, tbh
+				ESP_LOGI(TAG, "RAGE BUTTON PRESSED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+				act_streak = 0;
+			}
+			last_rage_time = now;
+			// 0x02 = LSHIFT modifier
+			// each streak increases the number of '?' sent
+			for (int i = 0; i <= act_streak; i++)
+			{
+				esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, key_buf, 1);
+				esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, key_buf, 0);
 			}
 		}
 	}
