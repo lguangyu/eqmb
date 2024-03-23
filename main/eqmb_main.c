@@ -14,7 +14,8 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
+#include "esp_sleep.h"
+// #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -28,6 +29,7 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "hid_dev.h"
 
 /**
@@ -55,6 +57,7 @@
 static SemaphoreHandle_t eqmb_ble_semaphore = NULL;
 // pairing status
 static bool eqmb_pairing_on = false;
+static bool eqmb_pairing_gpio_pressed = false;
 static QueueHandle_t eqmb_pairing_gpio_queue = NULL;
 static TimerHandle_t eqmb_pairing_timer = NULL;
 // bluetooth status
@@ -66,15 +69,18 @@ const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x7
 // the RAGE-BUTTON!!!!! FINALLY
 static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
 
-#define CHAR_DECLARATION_SIZE (sizeof(uint8_t))
+const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_25;	 // ? button for april to rage-press
+const static gpio_num_t eqmb_pairing_led_gpio_num = GPIO_NUM_26; // led to indicate advertising
+const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_27;	 // button to start pairing
 
-const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_18;	 // ? button for april to rage-press
-const static gpio_num_t eqmb_pairing_led_gpio_num = GPIO_NUM_19; // led to indicate advertising
-const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_21;	 // button to start pairing
+// sleep
+const static gpio_num_t eqmb_sleep_gpio_num = eqmb_pairing_gpio_num; // use the pairing button for wakeup
+static TimerHandle_t eqmb_sleep_timer = NULL;
+const static int eqmb_sleep_timer_duration = 120000 * portTICK_PERIOD_MS; // 2 minutes = 120,000 ms
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
-#define HIDD_DEVICE_NAME "Emergency Question Mark Button"
+#define HIDD_DEVICE_NAME "EQMB"
 static uint8_t hidd_service_uuid128[] = {
 	0xfb,
 	0x34,
@@ -121,14 +127,43 @@ static esp_ble_adv_params_t hidd_adv_params = {
 	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST,
 };
 
+static void eqmb_sleep_timer_callback(TimerHandle_t xTimer)
+{
+	ESP_LOGI(TAG, "configuring sleep");
+	// disable wifi and bluetooth
+	esp_bluedroid_disable();
+	esp_bt_controller_disable();
+	// configure for wakeup
+	esp_sleep_enable_ext0_wakeup(eqmb_sleep_gpio_num, 0);
+	rtc_gpio_pullup_en(eqmb_sleep_gpio_num);
+	rtc_gpio_pulldown_dis(eqmb_sleep_gpio_num);
+	// start deepsleep
+	ESP_LOGI(TAG, "start sleep");
+	esp_deep_sleep_start();
+	return;
+}
+
+static void eqmb_sleep_timer_init(void)
+{
+	eqmb_sleep_timer = xTimerCreate("eqmb_sleep_timer",
+									eqmb_sleep_timer_duration,
+									pdFALSE, NULL,
+									eqmb_sleep_timer_callback);
+	assert(eqmb_sleep_timer != NULL);
+	xTimerStart(eqmb_sleep_timer, 0);
+	return;
+}
+
 static void eqmb_pairing_led_task(void *arg)
 {
-	bool led_on = false;
+	bool blink_status = false;
+	bool led_on;
 	while (1)
 	{
-		led_on = !led_on;
-		gpio_set_level(GPIO_NUM_2, led_on && eqmb_pairing_on);
-		gpio_set_level(eqmb_pairing_led_gpio_num, led_on && eqmb_pairing_on);
+		blink_status = !blink_status;
+		led_on = eqmb_pairing_gpio_pressed || (blink_status && eqmb_pairing_on);
+		gpio_set_level(GPIO_NUM_2, led_on);
+		gpio_set_level(eqmb_pairing_led_gpio_num, led_on);
 		vTaskDelay(250 / portTICK_PERIOD_MS);
 	}
 	return;
@@ -206,14 +241,14 @@ static void eqmb_pairing_long_press_handler(void)
 	esp_ble_gap_disconnect(eqmb_current_remote_addr);
 	esp_ble_clear_bond_device();
 	esp_ble_gap_clear_whitelist();
-	// then start pairing mode
-	eqmb_pairing_start();
+	// then reset mcu
+	// eqmb_pairing_start();
+	esp_restart();
 	return;
 }
 
 static void eqmb_pairing_gpio_task(void *arg)
 {
-	bool pressed = false;
 	bool is_release_event;
 	uint64_t press_time = 0;
 
@@ -222,16 +257,16 @@ static void eqmb_pairing_gpio_task(void *arg)
 		if (xQueueReceive(eqmb_pairing_gpio_queue, NULL, portMAX_DELAY))
 		{
 			is_release_event = gpio_get_level(eqmb_pairing_gpio_num);
-			if ((!pressed) && (!is_release_event))
+			if ((!eqmb_pairing_gpio_pressed) && (!is_release_event))
 			{
 				// start of press timing
 				press_time = esp_timer_get_time();
-				pressed = true;
+				eqmb_pairing_gpio_pressed = true;
 			}
-			else if (pressed && is_release_event)
+			else if (eqmb_pairing_gpio_pressed && is_release_event)
 			{
 				// end of press timing
-				pressed = false;
+				eqmb_pairing_gpio_pressed = false;
 				// check press duration (5s mark)
 				if (esp_timer_get_time() - press_time < 5000000)
 				{
@@ -251,12 +286,20 @@ static void eqmb_pairing_gpio_task(void *arg)
 
 static void IRAM_ATTR eqmb_pairing_gpio_isr(void *arg)
 {
+	// jitter protection
 	static int64_t last_isr_time = 0;
+	if (!last_isr_time)
+	{
+		// ignore the first interrupt likely caused by reset
+		last_isr_time = esp_timer_get_time();
+		return;
+	}
 	int64_t now = esp_timer_get_time();
-	if (now - last_isr_time >= 100000)
+	if (now - last_isr_time >= 10000)
 	{
 		xQueueSendFromISR(eqmb_pairing_gpio_queue, NULL, NULL);
 		last_isr_time = now;
+		xTimerResetFromISR(eqmb_sleep_timer, NULL);
 	}
 	return;
 }
@@ -276,7 +319,7 @@ static void eqmb_pairing_gpio_init(void)
 	assert(eqmb_pairing_timer != NULL);
 	xTaskCreate(&eqmb_pairing_gpio_task, "eqmb_pairing_gpio_task", 2048, NULL, 5, NULL);
 	xTaskCreate(&eqmb_pairing_led_task, "eqmb_pairing_led_task", 1024, NULL, 5, NULL);
-	// connect pin
+	// pairing pin
 	gpio_config_t io_conf;
 	io_conf.intr_type = GPIO_INTR_ANYEDGE;
 	io_conf.mode = GPIO_MODE_INPUT;
@@ -322,15 +365,16 @@ static void eqmb_ragebtn_gpio_task(void *arg)
 	return;
 }
 
-static void eqmb_ragebtn_gpio_isr(void *arg)
+static void IRAM_ATTR eqmb_ragebtn_gpio_isr(void *arg)
 {
 	// jitter protection
 	static int64_t last_isr_time = 0;
 	int64_t now = esp_timer_get_time();
-	if (now - last_isr_time >= 200000)
+	if (now - last_isr_time >= 100000)
 	{
 		xQueueSendFromISR(eqmb_ragebtn_gpio_queue, NULL, NULL);
 		last_isr_time = now;
+		xTimerResetFromISR(eqmb_sleep_timer, NULL);
 	}
 	return;
 }
@@ -341,7 +385,7 @@ static void eqmb_ragebtn_gpio_init(void)
 	eqmb_ragebtn_gpio_queue = xQueueCreate(1, 0);
 	assert(eqmb_ragebtn_gpio_queue != NULL);
 	xTaskCreate(&eqmb_ragebtn_gpio_task, "eqmb_ragebtn_gpio_task", 2048, NULL, 10, NULL);
-	// connect pin
+	// rage button pin
 	gpio_config_t io_conf;
 	io_conf.intr_type = GPIO_INTR_NEGEDGE;
 	io_conf.mode = GPIO_MODE_INPUT;
@@ -506,6 +550,10 @@ static void eqmb_load_bond_devices_as_whitelist(void)
 
 void app_main(void)
 {
+	if (esp_sleep_get_wakeup_cause())
+		// just reset, don't bother with other stuff
+		esp_restart();
+
 	eqmb_ble_semaphore = xSemaphoreCreateMutex();
 	assert(eqmb_ble_semaphore != NULL);
 	// bt device init
@@ -520,7 +568,9 @@ void app_main(void)
 	esp_hidd_register_callbacks(hidd_event_callback);
 	eqmb_gap_init();
 	// init gpio
+	eqmb_sleep_timer_init();
 	gpio_install_isr_service(0);
 	eqmb_pairing_gpio_init();
 	eqmb_ragebtn_gpio_init();
+	return;
 }
