@@ -3,6 +3,7 @@
 .devcontainer
 .vscode/
 build/
+build
 sdkconfig.old
 sdkconfig.defaults
 .DS_Store

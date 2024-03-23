@@ -8,10 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -51,25 +53,29 @@
 
 // these variables should only be read/set in critical sections
 static SemaphoreHandle_t eqmb_ble_semaphore = NULL;
-static bool eqmb_adv_ready = false;
-static bool eqmb_adv_on = false;
-static uint16_t hid_conn_id = 0;
-static esp_bd_addr_t hid_conn_remote_addr = {0};
-static bool sec_conn = false;
+// pairing status
+static bool eqmb_pairing_on = false;
+static QueueHandle_t eqmb_pairing_gpio_queue = NULL;
+static TimerHandle_t eqmb_pairing_timer = NULL;
+// bluetooth status
+static bool eqmb_connected = false; // allow only one connection
+static uint16_t hidd_conn_id;
+static esp_bd_addr_t eqmb_current_remote_addr = {0};
+const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x73, 0x15};
+
+// the RAGE-BUTTON!!!!! FINALLY
+static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
 
 #define CHAR_DECLARATION_SIZE (sizeof(uint8_t))
-static TaskHandle_t eqmb_adv_led_blink_task_handle = NULL;
 
-#define EQMB_RAGEBTN_GPIO (GPIO_NUM_18)
-#define EQMB_ADV_LED_GPIO (GPIO_NUM_19)
-#define EQMB_CONNECT_GPIO (GPIO_NUM_21)
+const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_18;	 // ? button for april to rage-press
+const static gpio_num_t eqmb_pairing_led_gpio_num = GPIO_NUM_19; // led to indicate advertising
+const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_21;	 // button to start pairing
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
-#define HIDD_DEVICE_NAME "HID"
+#define HIDD_DEVICE_NAME "Emergency Question Mark Button"
 static uint8_t hidd_service_uuid128[] = {
-	/* LSB <--------------------------------------------------------------------------------> MSB */
-	// first uuid, 16bit, [12],[13] is the value
 	0xfb,
 	0x34,
 	0x9b,
@@ -94,7 +100,7 @@ static esp_ble_adv_data_t hidd_adv_data = {
 	.include_txpower = false,
 	.min_interval = 0x0006, // slave connection min interval, Time = min_interval * 1.25 msec
 	.max_interval = 0x0010, // slave connection max interval, Time = max_interval * 1.25 msec
-	.appearance = 0x03c0,	// HID Generic,
+	.appearance = 0x03c1,	// HID Keyboard,
 	.manufacturer_len = 0,
 	.p_manufacturer_data = NULL,
 	.service_data_len = 0,
@@ -108,61 +114,243 @@ static esp_ble_adv_params_t hidd_adv_params = {
 	.adv_int_min = 0x20,
 	.adv_int_max = 0x30,
 	.adv_type = ADV_TYPE_IND,
-	.own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+	.own_addr_type = BLE_ADDR_TYPE_RANDOM,
 	//.peer_addr            =
 	//.peer_addr_type       =
 	.channel_map = ADV_CHNL_ALL,
-	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST,
 };
 
-static void eqmb_adv_led_blink_task(void *arg)
+static void eqmb_pairing_led_task(void *arg)
 {
 	bool led_on = false;
 	while (1)
 	{
 		led_on = !led_on;
-		gpio_set_level(GPIO_NUM_2, led_on);		   // internal led
-		gpio_set_level(EQMB_ADV_LED_GPIO, led_on); // custom led
-		vTaskDelay(500 / portTICK_PERIOD_MS);
+		gpio_set_level(GPIO_NUM_2, led_on && eqmb_pairing_on);
+		gpio_set_level(eqmb_pairing_led_gpio_num, led_on && eqmb_pairing_on);
+		vTaskDelay(250 / portTICK_PERIOD_MS);
 	}
 	return;
 }
 
-static void eqmb_connect_gpio_handler(void *arg)
+static void eqmb_pairing_start(void)
 {
 	xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
-	ESP_LOGI(TAG, "Connect button released");
+	if (!eqmb_pairing_on)
+	{
+		eqmb_pairing_on = true;
+		hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+		esp_ble_gap_stop_advertising();
+		if (!eqmb_connected)
+			esp_ble_gap_start_advertising(&hidd_adv_params);
+		xTimerStart(eqmb_pairing_timer, 0);
+	}
 	xSemaphoreGive(eqmb_ble_semaphore);
-	// if (eqmb_adv_on)
-	//{
-	//	eqmb_adv_on = false;
-	//	esp_ble_gap_stop_advertising();
-	//	vTaskDelete(eqmb_adv_led_blink_task_handle);
-	// }
-	// else
-	//{
-	//	if (sec_conn)
-	//		esp_ble_gap_disconnect(hid_conn_remote_addr);
-	//	eqmb_adv_on = true;
-	//	esp_ble_gap_start_advertising(&hidd_adv_params);
-	//	xTaskCreate(eqmb_adv_led_blink_task, "eqmb_adv_led_blink_task", 1024,
-	//				NULL, 5, &eqmb_adv_led_blink_task_handle);
-	// }
-	// xSemaphoreGive(eqmb_ble_semaphore);
 	return;
 }
 
-static void eqmb_connect_gpio_init(void)
+static void eqmb_pairing_stop(void)
 {
+	xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
+	if (eqmb_pairing_on)
+	{
+		eqmb_pairing_on = false;
+		hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST;
+		esp_ble_gap_stop_advertising();
+		if (!eqmb_connected)
+			esp_ble_gap_start_advertising(&hidd_adv_params);
+	}
+	xSemaphoreGive(eqmb_ble_semaphore);
+	return;
+}
+
+static void eqmb_pairing_timer_callback(TimerHandle_t xTimer)
+{
+	eqmb_pairing_stop();
+	return;
+}
+
+static void esp_ble_clear_bond_device(void)
+{
+	int bond_dev_num = esp_ble_get_bond_device_num();
+	esp_ble_bond_dev_t *bond_dev_list = (esp_ble_bond_dev_t *)malloc(bond_dev_num * sizeof(esp_ble_bond_dev_t));
+	esp_ble_get_bond_device_list(&bond_dev_num, bond_dev_list);
+	for (int i = 0; i < bond_dev_num; i++)
+		esp_ble_remove_bond_device(bond_dev_list[i].bd_addr);
+	free(bond_dev_list);
+	return;
+}
+
+static void eqmb_pairing_short_press_handler(void)
+{
+	if (!eqmb_pairing_on)
+	{
+		ESP_LOGI(TAG, "start pairing mode");
+		eqmb_pairing_start();
+	}
+	else
+	{
+		ESP_LOGI(TAG, "stop pairing mode");
+		eqmb_pairing_stop();
+	}
+	return;
+}
+
+static void eqmb_pairing_long_press_handler(void)
+{
+	// long press reset the bond devices connections, whitelist
+	xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
+	eqmb_pairing_on = false;
+	xSemaphoreGive(eqmb_ble_semaphore);
+	esp_ble_gap_disconnect(eqmb_current_remote_addr);
+	esp_ble_clear_bond_device();
+	esp_ble_gap_clear_whitelist();
+	// then start pairing mode
+	eqmb_pairing_start();
+	return;
+}
+
+static void eqmb_pairing_gpio_task(void *arg)
+{
+	bool pressed = false;
+	bool is_release_event;
+	uint64_t press_time = 0;
+
+	while (1)
+	{
+		if (xQueueReceive(eqmb_pairing_gpio_queue, NULL, portMAX_DELAY))
+		{
+			is_release_event = gpio_get_level(eqmb_pairing_gpio_num);
+			if ((!pressed) && (!is_release_event))
+			{
+				// start of press timing
+				press_time = esp_timer_get_time();
+				pressed = true;
+			}
+			else if (pressed && is_release_event)
+			{
+				// end of press timing
+				pressed = false;
+				// check press duration (5s mark)
+				if (esp_timer_get_time() - press_time < 5000000)
+				{
+					ESP_LOGI(TAG, "short press detected");
+					eqmb_pairing_short_press_handler();
+				}
+				else
+				{
+					ESP_LOGI(TAG, "long press detected");
+					eqmb_pairing_long_press_handler();
+				}
+			}
+		}
+	}
+	return;
+}
+
+static void IRAM_ATTR eqmb_pairing_gpio_isr(void *arg)
+{
+	static int64_t last_isr_time = 0;
+	int64_t now = esp_timer_get_time();
+	if (now - last_isr_time >= 100000)
+	{
+		xQueueSendFromISR(eqmb_pairing_gpio_queue, NULL, NULL);
+		last_isr_time = now;
+	}
+	return;
+}
+
+static void eqmb_pairing_gpio_init(void)
+{
+	// leds
+	gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+	gpio_set_direction(eqmb_pairing_led_gpio_num, GPIO_MODE_OUTPUT);
+	// create tasks
+	eqmb_pairing_gpio_queue = xQueueCreate(1, 0);
+	assert(eqmb_pairing_gpio_queue != NULL);
+	eqmb_pairing_timer = xTimerCreate("eqmb_pairing_timer",
+									  30000 / portTICK_PERIOD_MS,
+									  pdFALSE, NULL,
+									  eqmb_pairing_timer_callback);
+	assert(eqmb_pairing_timer != NULL);
+	xTaskCreate(&eqmb_pairing_gpio_task, "eqmb_pairing_gpio_task", 2048, NULL, 5, NULL);
+	xTaskCreate(&eqmb_pairing_led_task, "eqmb_pairing_led_task", 1024, NULL, 5, NULL);
+	// connect pin
 	gpio_config_t io_conf;
-	io_conf.intr_type = GPIO_INTR_POSEDGE;
+	io_conf.intr_type = GPIO_INTR_ANYEDGE;
 	io_conf.mode = GPIO_MODE_INPUT;
-	io_conf.pin_bit_mask = 1ULL << EQMB_CONNECT_GPIO;
-	io_conf.pull_down_en = 0;
-	io_conf.pull_up_en = 1;
-	ESP_ERROR_CHECK(gpio_config(&io_conf));
-	ESP_ERROR_CHECK(gpio_install_isr_service(0));
-	ESP_ERROR_CHECK(gpio_isr_handler_add(EQMB_CONNECT_GPIO, eqmb_connect_gpio_handler, NULL));
+	io_conf.pin_bit_mask = 1ULL << eqmb_pairing_gpio_num;
+	io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+	io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+	gpio_config(&io_conf);
+	gpio_isr_handler_add(eqmb_pairing_gpio_num, eqmb_pairing_gpio_isr, NULL);
+	return;
+}
+
+static void eqmb_ragebtn_gpio_task(void *arg)
+{
+	int64_t last_rage_time = 0, now = 0;
+	uint8_t act_streak = 0;
+	uint8_t buffer[] = {HID_KEY_FWD_SLASH};
+	while (1)
+	{
+		if (xQueueReceive(eqmb_ragebtn_gpio_queue, NULL, portMAX_DELAY))
+		{
+			if (eqmb_connected)
+			{
+				now = esp_timer_get_time();
+				if (now - last_rage_time < 750000)
+				{
+					ESP_LOGI(TAG, "RAGE BUTTON STREAK!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+					act_streak += (act_streak < 5) ? 1 : 0; // max 5, for 6 chars
+				}
+				else
+				{
+					// a little bit of boring here, tbh
+					ESP_LOGI(TAG, "RAGE BUTTON PRESSED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+					act_streak = 0;
+				}
+				last_rage_time = now;
+				// 0x02 = LSHIFT modifier
+				for (int i = 0; i <= act_streak; i++)
+					esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, buffer, 1);
+				esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, buffer, 0);
+			}
+		}
+	}
+	return;
+}
+
+static void eqmb_ragebtn_gpio_isr(void *arg)
+{
+	// jitter protection
+	static int64_t last_isr_time = 0;
+	int64_t now = esp_timer_get_time();
+	if (now - last_isr_time >= 200000)
+	{
+		xQueueSendFromISR(eqmb_ragebtn_gpio_queue, NULL, NULL);
+		last_isr_time = now;
+	}
+	return;
+}
+
+static void eqmb_ragebtn_gpio_init(void)
+{
+	// create tasks
+	eqmb_ragebtn_gpio_queue = xQueueCreate(1, 0);
+	assert(eqmb_ragebtn_gpio_queue != NULL);
+	xTaskCreate(&eqmb_ragebtn_gpio_task, "eqmb_ragebtn_gpio_task", 2048, NULL, 10, NULL);
+	// connect pin
+	gpio_config_t io_conf;
+	io_conf.intr_type = GPIO_INTR_NEGEDGE;
+	io_conf.mode = GPIO_MODE_INPUT;
+	io_conf.pin_bit_mask = 1ULL << eqmb_ragebtn_gpio_num;
+	io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+	io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+	gpio_config(&io_conf);
+	// gpio_install_isr_service(0);
+	gpio_isr_handler_add(eqmb_ragebtn_gpio_num, eqmb_ragebtn_gpio_isr, NULL);
 	return;
 }
 
@@ -171,52 +359,33 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
 	switch (event)
 	{
 	case ESP_HIDD_EVENT_REG_FINISH:
-	{
 		if (param->init_finish.state == ESP_HIDD_INIT_OK)
 		{
-			// esp_bd_addr_t rand_addr = {0x04,0x11,0x11,0x11,0x11,0x05};
 			esp_ble_gap_set_device_name(HIDD_DEVICE_NAME);
 			esp_ble_gap_config_adv_data(&hidd_adv_data);
-			xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
-			eqmb_adv_ready = true;
-			xSemaphoreGive(eqmb_ble_semaphore);
 		}
 		break;
-	}
 	case ESP_BAT_EVENT_REG:
 		break;
 	case ESP_HIDD_EVENT_DEINIT_FINISH:
 		break;
 	case ESP_HIDD_EVENT_BLE_CONNECT:
-	{
 		ESP_LOGI(TAG, "ESP_HIDD_EVENT_BLE_CONNECT");
-		xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
-		hid_conn_id = param->connect.conn_id;
-		memcpy(hid_conn_remote_addr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-		xSemaphoreGive(eqmb_ble_semaphore);
+		hidd_conn_id = param->connect.conn_id;
 		break;
-	}
 	case ESP_HIDD_EVENT_BLE_DISCONNECT:
-	{
-		xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
-		sec_conn = false;
-		xSemaphoreGive(eqmb_ble_semaphore);
 		ESP_LOGI(TAG, "ESP_HIDD_EVENT_BLE_DISCONNECT");
-		// esp_ble_gap_start_advertising(&hidd_adv_params);
+		eqmb_connected = false;
+		esp_ble_gap_start_advertising(&hidd_adv_params);
 		break;
-	}
 	case ESP_HIDD_EVENT_BLE_VENDOR_REPORT_WRITE_EVT:
-	{
 		ESP_LOGI(TAG, "%s, ESP_HIDD_EVENT_BLE_VENDOR_REPORT_WRITE_EVT", __func__);
 		ESP_LOG_BUFFER_HEX(TAG, param->vendor_write.data, param->vendor_write.length);
 		break;
-	}
 	case ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT:
-	{
 		ESP_LOGI(TAG, "ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT");
 		ESP_LOG_BUFFER_HEX(TAG, param->led_write.data, param->led_write.length);
 		break;
-	}
 	default:
 		break;
 	}
@@ -228,7 +397,8 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 	switch (event)
 	{
 	case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-		// esp_ble_gap_start_advertising(&hidd_adv_params);
+		if (!eqmb_connected)
+			esp_ble_gap_start_advertising(&hidd_adv_params);
 		break;
 	case ESP_GAP_BLE_SEC_REQ_EVT:
 		for (int i = 0; i < ESP_BD_ADDR_LEN; i++)
@@ -236,9 +406,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 		esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
 		break;
 	case ESP_GAP_BLE_AUTH_CMPL_EVT:
-		xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
-		sec_conn = true;
-		xSemaphoreGive(eqmb_ble_semaphore);
 		esp_bd_addr_t bd_addr;
 		memcpy(bd_addr, param->ble_security.auth_cmpl.bd_addr, sizeof(esp_bd_addr_t));
 		ESP_LOGI(TAG, "remote BD_ADDR: %08x%04x",
@@ -247,16 +414,28 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 		ESP_LOGI(TAG, "address type = %d", param->ble_security.auth_cmpl.addr_type);
 		ESP_LOGI(TAG, "pair status = %s", param->ble_security.auth_cmpl.success ? "success" : "fail");
 		if (!param->ble_security.auth_cmpl.success)
+		{
 			ESP_LOGE(TAG, "fail reason = 0x%x", param->ble_security.auth_cmpl.fail_reason);
+			break;
+		}
+		// disconnect the old device when connected if applicable
+		if (eqmb_connected)
+		{
+			esp_ble_gap_disconnect(eqmb_current_remote_addr);
+			esp_ble_remove_bond_device(eqmb_current_remote_addr);
+			esp_ble_gap_update_whitelist(false, eqmb_current_remote_addr, BLE_ADDR_TYPE_PUBLIC);
+		}
+		// update new connection status
+		xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
+		eqmb_connected = true;
+		memcpy(eqmb_current_remote_addr, bd_addr, sizeof(esp_bd_addr_t));
+		xSemaphoreGive(eqmb_ble_semaphore);
+		esp_ble_gap_update_whitelist(true, bd_addr, BLE_ADDR_TYPE_PUBLIC);
+		eqmb_pairing_stop();
 		break;
 	default:
 		break;
 	}
-}
-
-void hid_demo_task(void *pvParameters)
-{
-	return;
 }
 
 static void eqmb_nvs_flash_init(void)
@@ -309,21 +488,39 @@ static void eqmb_gap_init(void)
 	return;
 }
 
+static void eqmb_load_bond_devices_as_whitelist(void)
+{
+	int bond_dev_num = esp_ble_get_bond_device_num();
+	esp_ble_bond_dev_t *bond_dev_list = (esp_ble_bond_dev_t *)malloc(bond_dev_num * sizeof(esp_ble_bond_dev_t));
+	esp_ble_get_bond_device_list(&bond_dev_num, bond_dev_list);
+	for (int i = 0; i < bond_dev_num; i++)
+	{
+		ESP_ERROR_CHECK(esp_ble_gap_update_whitelist(true, bond_dev_list[i].bd_addr, BLE_ADDR_TYPE_PUBLIC));
+		ESP_LOGI(TAG, "adding bond device to whitelist: %08x%04x",
+				 (bond_dev_list[i].bd_addr[0] << 24) + (bond_dev_list[i].bd_addr[1] << 16) + (bond_dev_list[i].bd_addr[2] << 8) + bond_dev_list[i].bd_addr[3],
+				 (bond_dev_list[i].bd_addr[4] << 8) + bond_dev_list[i].bd_addr[5]);
+	}
+	free(bond_dev_list);
+	return;
+}
+
 void app_main(void)
 {
-	if (eqmb_ble_semaphore == NULL)
-		eqmb_ble_semaphore = xSemaphoreCreateMutex();
+	eqmb_ble_semaphore = xSemaphoreCreateMutex();
+	assert(eqmb_ble_semaphore != NULL);
 	// bt device init
 	eqmb_nvs_flash_init();
 	eqmb_bt_controller_init();
 	eqmb_bluedroid_init();
+	ESP_ERROR_CHECK(esp_ble_gap_set_rand_addr((uint8_t *)eqmb_static_local_addr));
 	ESP_ERROR_CHECK(esp_hidd_profile_init());
+	eqmb_load_bond_devices_as_whitelist();
 	// register the callback function to the gap module
 	esp_ble_gap_register_callback(gap_event_handler);
 	esp_hidd_register_callbacks(hidd_event_callback);
 	eqmb_gap_init();
 	// init gpio
-	eqmb_connect_gpio_init();
-
-	// xTaskCreate(&hid_demo_task, "hid_task", 2048, NULL, 5, NULL);
+	gpio_install_isr_service(0);
+	eqmb_pairing_gpio_init();
+	eqmb_ragebtn_gpio_init();
 }
