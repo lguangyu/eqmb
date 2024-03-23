@@ -11,15 +11,15 @@ This is an application based on ESP32 microcontroller. It comes with a top Rage-
 
 ### Power
 
-This device is powered by a single 16340 lithium battern that can be recharged from micro-USB. There is a power switch on the bottom side of the device.
+This device is powered by a single 16340 lithium battery that can be recharged from micro-USB. There is a power switch on the bottom side of the device.
 
 ### Rage-Button
 
-When pressed, the top button sends a <kbd>?</kbd> character to the host computer. Following-up presses within 750ms of the preceding one will send more <kbd>?</kbd>s, up to 6 in a single press. This feature is called "rage streak".
+When pressed, the top button sends a <kbd>?</kbd> character to the host computer. Follow-up presses within 750ms of the preceding one will send more <kbd>?</kbd>s, up to 6 in a single press. This feature is called "rage streak".
 
 ### Bluetooth (BT) Control Button
 
-When the BT control button is pushed, the device will enter BT pairing mode for accepting new devices, as indicated by a flashing blue LED. A second push will exit the pairing mode.
+When the BT control button is pushed, the device will enter BT pairing mode (with blue LED flashing) for accepting new device pairings. A second push will exit the pairing mode.
 
 Releasing the BT control button after holding it for over 3sec will trigger a hard reset of the device, deleting all paired devices.
 
