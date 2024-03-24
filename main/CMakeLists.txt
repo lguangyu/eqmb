@@ -1,5 +1,5 @@
 idf_component_register(
-	SRCS "eqmb_main.c"
+	SRCS "eqmb_spec_str.c" "eqmb_main.c"
 	"esp_hidd_prf_api.c"
 	"hid_dev.c"
 	"hid_device_le_prf.c"

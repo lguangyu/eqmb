@@ -15,6 +15,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_random.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -68,6 +69,10 @@ const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x7
 
 // the RAGE-BUTTON!!!!! FINALLY
 static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
+// this spec str list must have length of 2^n
+#define ENABLE_SPEC_STR 1 // comment out this line to disable special string
+const static uint8_t eqmb_ragebtn_spec_str_len = 4;
+extern const keyboard_cmd_t **eqmb_ragebtn_spec_str[4];
 
 const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_25;	 // ? button for april to rage-press
 const static gpio_num_t eqmb_pairing_led_gpio_num = GPIO_NUM_26; // led to indicate advertising
@@ -350,11 +355,71 @@ static void eqmb_pairing_gpio_init(void)
 	return;
 }
 
+static void eqmb_ragebtn_send_key(uint8_t act_streak)
+{
+	const static keyboard_cmd_t **sstr_word_p = NULL;	// NULL = send normal ?
+	static int spec_str_due = 11;						// this is a magical number
+	static keyboard_cmd_t qm_buf = {HID_KEY_FWD_SLASH}; // used send regular ?
+
+#ifndef ENABLE_SPEC_STR
+	for (int i = 0; i < act_streak; i++)
+	{
+		esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, &qm_buf, 1);
+		esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, &qm_buf, 0);
+	}
+#else
+	// re-fill value of spec_str_due
+	if ((sstr_word_p == NULL) && (spec_str_due == 0))
+	{
+		spec_str_due = esp_random() & 0x1f;
+		if (spec_str_due < 0x08) // at least 8 presses to trigger special string
+			spec_str_due += 0x08;
+	}
+	// check if need to send special string
+	if (sstr_word_p == NULL)
+	{
+		// send regular ?, act_streak increase the number of ?
+		for (int i = 0; i <= act_streak; i++)
+		{
+			esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, &qm_buf, 1);
+			esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, &qm_buf, 0);
+		}
+		spec_str_due--;
+		if ((spec_str_due == 0) && (eqmb_ragebtn_spec_str_len > 0))
+		{
+			// next press will send special string
+			// determine the next special string
+			sstr_word_p = eqmb_ragebtn_spec_str[esp_random() & (eqmb_ragebtn_spec_str_len - 1)];
+		}
+	}
+	else
+	{
+		// send special string
+		if (!*sstr_word_p)
+			return;
+		// send the keys
+		const keyboard_cmd_t *c = *sstr_word_p;
+		while (*c) // NULL-terminated
+		{
+			key_mask_t mask = ((*c == HID_KEY_SPACEBAR) || (*c == HID_KEY_SGL_QUOTE) || (*c == HID_KEY_DOT)) ? 0x00 : 0x02;
+			esp_hidd_send_keyboard_value(hidd_conn_id, mask, (keyboard_cmd_t *)c, 1);
+			esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, (keyboard_cmd_t *)c, 0);
+			c++;
+		}
+		// move to next word
+		sstr_word_p++;
+		if (!*sstr_word_p)
+			// end of the special string
+			sstr_word_p = NULL;
+	}
+#endif // ENABLE_SPEC_STR
+	return;
+}
+
 static void eqmb_ragebtn_gpio_task(void *arg)
 {
 	int64_t last_rage_time = 0, curr_isr_time; // last_rage_time = last_isr_time
 	uint8_t act_streak = 0;
-	uint8_t key_buf[] = {HID_KEY_FWD_SLASH};
 	while (1)
 	{
 		if (xQueueReceive(eqmb_ragebtn_gpio_queue, NULL, portMAX_DELAY))
@@ -392,12 +457,8 @@ static void eqmb_ragebtn_gpio_task(void *arg)
 			// update last_rage_time here
 			last_rage_time = curr_isr_time;
 			// 0x02 = LSHIFT modifier
-			// each streak increases the number of '?' sent
-			for (int i = 0; i <= act_streak; i++)
-			{
-				esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, key_buf, 1);
-				esp_hidd_send_keyboard_value(hidd_conn_id, 0x00, key_buf, 0);
-			}
+			// use time as the random number
+			eqmb_ragebtn_send_key(act_streak);
 		}
 	}
 	return;
