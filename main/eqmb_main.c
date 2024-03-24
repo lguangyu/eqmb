@@ -15,7 +15,6 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
-// #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -53,7 +52,7 @@
 
 #define TAG "EQMB"
 
-// these variables should only be read/set in critical sections
+// use this lock to access below variables if necessary
 static SemaphoreHandle_t eqmb_ble_semaphore = NULL;
 // pairing status
 static bool eqmb_pairing_on = false;
@@ -61,7 +60,8 @@ static bool eqmb_pairing_gpio_pressed = false;
 static QueueHandle_t eqmb_pairing_gpio_queue = NULL;
 static TimerHandle_t eqmb_pairing_timer = NULL;
 // bluetooth status
-static bool eqmb_connected = false; // allow only one connection
+static bool eqmb_connected = false; // bool = only one connection
+									// otherwise, should use a counter
 static uint16_t hidd_conn_id;
 static esp_bd_addr_t eqmb_current_remote_addr = {0};
 const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x73, 0x15};
@@ -77,8 +77,6 @@ const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_27;	 // button to start
 const static gpio_num_t eqmb_sleep_gpio_num = eqmb_pairing_gpio_num; // use the pairing button for wakeup
 static TimerHandle_t eqmb_sleep_timer = NULL;
 const static int eqmb_sleep_timer_duration = 120000 * portTICK_PERIOD_MS; // 2 minutes = 120,000 ms
-
-static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
 #define HIDD_DEVICE_NAME "EQMB"
 static uint8_t hidd_service_uuid128[] = {
@@ -127,6 +125,21 @@ static esp_ble_adv_params_t hidd_adv_params = {
 	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST,
 };
 
+static void IRAM_ATTR delay_microsecond(int64_t us)
+{
+	if (us == 0)
+		return;
+	int64_t start = esp_timer_get_time();
+	int64_t end = start + us;
+	if (end < start)
+		// this is overflow, though we should not reach here since 2^63 us is
+		// 292471 years
+		return;
+	while (esp_timer_get_time() < end)
+		asm("nop"); // busy waiting, but ok within several us i guess
+	return;
+}
+
 static void eqmb_sleep_timer_callback(TimerHandle_t xTimer)
 {
 	ESP_LOGI(TAG, "configuring sleep");
@@ -164,7 +177,7 @@ static void eqmb_pairing_led_task(void *arg)
 		led_on = eqmb_pairing_gpio_pressed || (blink_status && eqmb_pairing_on);
 		gpio_set_level(GPIO_NUM_2, led_on);
 		gpio_set_level(eqmb_pairing_led_gpio_num, led_on);
-		vTaskDelay(250 / portTICK_PERIOD_MS);
+		vTaskDelay(200 / portTICK_PERIOD_MS);
 	}
 	return;
 }
@@ -241,6 +254,8 @@ static void eqmb_pairing_long_press_handler(void)
 	esp_ble_gap_disconnect(eqmb_current_remote_addr);
 	esp_ble_clear_bond_device();
 	esp_ble_gap_clear_whitelist();
+	// add some delay for the bond device and whitelist update to take place
+	vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
 	// then reset mcu
 	// eqmb_pairing_start();
 	esp_restart();
@@ -249,18 +264,29 @@ static void eqmb_pairing_long_press_handler(void)
 
 static void eqmb_pairing_gpio_task(void *arg)
 {
+	int64_t last_isr_time = 0, curr_isr_time;
+	uint32_t press_time = 0;
 	bool is_release_event;
-	uint64_t press_time = 0;
 
 	while (1)
 	{
 		if (xQueueReceive(eqmb_pairing_gpio_queue, NULL, portMAX_DELAY))
 		{
+			curr_isr_time = esp_timer_get_time();
+			// jitter protection
+			// if registered too quickly, ignore
+			if (curr_isr_time - last_isr_time < 20000) // 20ms
+				continue;
+			// now consider it as a valid press
+			last_isr_time = curr_isr_time;
+			xTimerReset(eqmb_sleep_timer, 0);
+			// delay 10ms then test the pin level
+			delay_microsecond(10000); // 10ms debounce
 			is_release_event = gpio_get_level(eqmb_pairing_gpio_num);
 			if ((!eqmb_pairing_gpio_pressed) && (!is_release_event))
 			{
 				// start of press timing
-				press_time = esp_timer_get_time();
+				press_time = curr_isr_time;
 				eqmb_pairing_gpio_pressed = true;
 			}
 			else if (eqmb_pairing_gpio_pressed && is_release_event)
@@ -268,7 +294,8 @@ static void eqmb_pairing_gpio_task(void *arg)
 				// end of press timing
 				eqmb_pairing_gpio_pressed = false;
 				// check press duration (5s mark)
-				if (esp_timer_get_time() - press_time < 5000000)
+				press_time = curr_isr_time - press_time;
+				if (press_time < 5000000)
 				{
 					ESP_LOGI(TAG, "short press detected");
 					eqmb_pairing_short_press_handler();
@@ -279,6 +306,11 @@ static void eqmb_pairing_gpio_task(void *arg)
 					eqmb_pairing_long_press_handler();
 				}
 			}
+			else
+			{
+				// something unexpected happened, but we need to reset the state
+				eqmb_pairing_gpio_pressed = false;
+			}
 		}
 	}
 	return;
@@ -286,21 +318,8 @@ static void eqmb_pairing_gpio_task(void *arg)
 
 static void IRAM_ATTR eqmb_pairing_gpio_isr(void *arg)
 {
-	// jitter protection
-	static int64_t last_isr_time = 0;
-	if (!last_isr_time)
-	{
-		// ignore the first interrupt likely caused by reset
-		last_isr_time = esp_timer_get_time();
-		return;
-	}
-	int64_t now = esp_timer_get_time();
-	if (now - last_isr_time >= 10000)
-	{
-		xQueueSendFromISR(eqmb_pairing_gpio_queue, NULL, NULL);
-		last_isr_time = now;
-		xTimerResetFromISR(eqmb_sleep_timer, NULL);
-	}
+	// jitter protection in handler
+	xQueueSendFromISR(eqmb_pairing_gpio_queue, NULL, NULL);
 	return;
 }
 
@@ -333,32 +352,45 @@ static void eqmb_pairing_gpio_init(void)
 
 static void eqmb_ragebtn_gpio_task(void *arg)
 {
-	int64_t last_rage_time = 0, now = 0;
+	int64_t last_rage_time = 0, curr_isr_time; // last_rage_time = last_isr_time
 	uint8_t act_streak = 0;
 	uint8_t key_buf[] = {HID_KEY_FWD_SLASH};
 	while (1)
 	{
 		if (xQueueReceive(eqmb_ragebtn_gpio_queue, NULL, portMAX_DELAY))
 		{
+			curr_isr_time = esp_timer_get_time();
+			// jitter protection
+			// if registered too quickly, ignore
+			if (curr_isr_time - last_rage_time < 50000) // 50ms
+				continue;
+			// delay 10ms then test the pin level
+			delay_microsecond(10000); // 10ms debounce
+			if (gpio_get_level(eqmb_ragebtn_gpio_num) == 1)
+				continue;
+			// now consider it as a valid press
+			xTimerReset(eqmb_sleep_timer, 0);
+			// we still need the last_rage_time for the streak detection, so
+			// no update here
 			if (!eqmb_connected)
 				continue;
-
-			now = esp_timer_get_time();
-			// 750ms grace period for 'rage mode', considering the agility
-			// stat of the certain professor
-			if (now - last_rage_time < 750000)
+			if (curr_isr_time - last_rage_time < 750000)
 			{
-				// this is exiciting!
-				ESP_LOGI(TAG, "RAGE BUTTON STREAK!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+				// 750ms grace period for 'rage mode', considering the agility
+				// stat of the certain professor
+
+				// streak is exiciting! need 16 !s
+				ESP_LOGI(TAG, "RAGE BUTTON STREAK!!!!!!!!!!!!!!!!");
 				act_streak += (act_streak < 5) ? 1 : 0; // max 5, for 6 chars
 			}
 			else
 			{
-				// a little bit of boring here, tbh
-				ESP_LOGI(TAG, "RAGE BUTTON PRESSED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+				// a little bit of boring here, tbh; so only 8 !s
+				ESP_LOGI(TAG, "RAGE BUTTON PRESSED!!!!!!!!");
 				act_streak = 0;
 			}
-			last_rage_time = now;
+			// update last_rage_time here
+			last_rage_time = curr_isr_time;
 			// 0x02 = LSHIFT modifier
 			// each streak increases the number of '?' sent
 			for (int i = 0; i <= act_streak; i++)
@@ -373,15 +405,8 @@ static void eqmb_ragebtn_gpio_task(void *arg)
 
 static void IRAM_ATTR eqmb_ragebtn_gpio_isr(void *arg)
 {
-	// jitter protection
-	static int64_t last_isr_time = 0;
-	int64_t now = esp_timer_get_time();
-	if (now - last_isr_time >= 100000)
-	{
-		xQueueSendFromISR(eqmb_ragebtn_gpio_queue, NULL, NULL);
-		last_isr_time = now;
-		xTimerResetFromISR(eqmb_sleep_timer, NULL);
-	}
+	// jitter protection in handler
+	xQueueSendToBackFromISR(eqmb_ragebtn_gpio_queue, NULL, pdFALSE);
 	return;
 }
 
