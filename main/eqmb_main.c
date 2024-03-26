@@ -70,7 +70,7 @@ const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x7
 // the RAGE-BUTTON!!!!! FINALLY
 static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
 // this spec str list must have length of 2^n
-#define ENABLE_SPEC_STR 1 // comment out this line to disable special string
+#define EQMB_ENABLE_SPEC_STR 1 // comment out this line to disable special string
 const static uint8_t eqmb_ragebtn_spec_str_len = 4;
 extern const keyboard_cmd_t **eqmb_ragebtn_spec_str[4];
 
@@ -81,7 +81,7 @@ const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_27;	 // button to start
 // sleep
 const static gpio_num_t eqmb_sleep_gpio_num = eqmb_pairing_gpio_num; // use the pairing button for wakeup
 static TimerHandle_t eqmb_sleep_timer = NULL;
-const static int eqmb_sleep_timer_duration = 120000 * portTICK_PERIOD_MS; // 2 minutes = 120,000 ms
+const static int eqmb_sleep_timer_duration = 120000 / portTICK_PERIOD_MS; // 2 minutes = 120,000 ms
 
 #define HIDD_DEVICE_NAME "EQMB"
 static uint8_t hidd_service_uuid128[] = {
@@ -124,8 +124,6 @@ static esp_ble_adv_params_t hidd_adv_params = {
 	.adv_int_max = 0x30,
 	.adv_type = ADV_TYPE_IND,
 	.own_addr_type = BLE_ADDR_TYPE_RANDOM,
-	//.peer_addr            =
-	//.peer_addr_type       =
 	.channel_map = ADV_CHNL_ALL,
 	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST,
 };
@@ -192,11 +190,11 @@ static void eqmb_pairing_start(void)
 	xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
 	if (!eqmb_pairing_on)
 	{
+		ESP_LOGI(TAG, "start pairing mode");
 		eqmb_pairing_on = true;
 		hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
 		esp_ble_gap_stop_advertising();
-		if (!eqmb_connected)
-			esp_ble_gap_start_advertising(&hidd_adv_params);
+		esp_ble_gap_start_advertising(&hidd_adv_params);
 		xTimerStart(eqmb_pairing_timer, 0);
 	}
 	xSemaphoreGive(eqmb_ble_semaphore);
@@ -208,11 +206,12 @@ static void eqmb_pairing_stop(void)
 	xSemaphoreTake(eqmb_ble_semaphore, portMAX_DELAY);
 	if (eqmb_pairing_on)
 	{
+		ESP_LOGI(TAG, "stop pairing mode");
 		eqmb_pairing_on = false;
 		hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST;
 		esp_ble_gap_stop_advertising();
-		if (!eqmb_connected)
-			esp_ble_gap_start_advertising(&hidd_adv_params);
+		esp_ble_gap_start_advertising(&hidd_adv_params);
+		xTimerStop(eqmb_pairing_timer, 0);
 	}
 	xSemaphoreGive(eqmb_ble_semaphore);
 	return;
@@ -220,6 +219,7 @@ static void eqmb_pairing_stop(void)
 
 static void eqmb_pairing_timer_callback(TimerHandle_t xTimer)
 {
+	ESP_LOGI(TAG, "pairing mode timeout");
 	eqmb_pairing_stop();
 	return;
 }
@@ -238,15 +238,9 @@ static void esp_ble_clear_bond_device(void)
 static void eqmb_pairing_short_press_handler(void)
 {
 	if (!eqmb_pairing_on)
-	{
-		ESP_LOGI(TAG, "start pairing mode");
 		eqmb_pairing_start();
-	}
 	else
-	{
-		ESP_LOGI(TAG, "stop pairing mode");
 		eqmb_pairing_stop();
-	}
 	return;
 }
 
@@ -284,7 +278,8 @@ static void eqmb_pairing_gpio_task(void *arg)
 				continue;
 			// now consider it as a valid press
 			last_isr_time = curr_isr_time;
-			xTimerReset(eqmb_sleep_timer, 0);
+			if (eqmb_sleep_timer)
+				xTimerReset(eqmb_sleep_timer, 0);
 			// delay 10ms then test the pin level
 			delay_microsecond(10000); // 10ms debounce
 			is_release_event = gpio_get_level(eqmb_pairing_gpio_num);
@@ -361,7 +356,7 @@ static void eqmb_ragebtn_send_key(uint8_t act_streak)
 	static int spec_str_due = 11;						// this is a magical number
 	static keyboard_cmd_t qm_buf = {HID_KEY_FWD_SLASH}; // used send regular ?
 
-#ifndef ENABLE_SPEC_STR
+#ifndef EQMB_ENABLE_SPEC_STR
 	for (int i = 0; i < act_streak; i++)
 	{
 		esp_hidd_send_keyboard_value(hidd_conn_id, 0x02, &qm_buf, 1);
@@ -412,7 +407,7 @@ static void eqmb_ragebtn_send_key(uint8_t act_streak)
 			// end of the special string
 			sstr_word_p = NULL;
 	}
-#endif // ENABLE_SPEC_STR
+#endif // EQMB_ENABLE_SPEC_STR
 	return;
 }
 
@@ -434,7 +429,8 @@ static void eqmb_ragebtn_gpio_task(void *arg)
 			if (gpio_get_level(eqmb_ragebtn_gpio_num) == 1)
 				continue;
 			// now consider it as a valid press
-			xTimerReset(eqmb_sleep_timer, 0);
+			if (eqmb_sleep_timer)
+				xTimerReset(eqmb_sleep_timer, 0);
 			// we still need the last_rage_time for the streak detection, so
 			// no update here
 			if (!eqmb_connected)
@@ -539,7 +535,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 	case ESP_GAP_BLE_SEC_REQ_EVT:
 		for (int i = 0; i < ESP_BD_ADDR_LEN; i++)
 			ESP_LOGD(TAG, "%x:", param->ble_security.ble_req.bd_addr[i]);
-		esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+		ESP_ERROR_CHECK(esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true));
 		break;
 	case ESP_GAP_BLE_AUTH_CMPL_EVT:
 		esp_bd_addr_t bd_addr;
@@ -555,7 +551,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 			break;
 		}
 		// disconnect the old device when connected if applicable
-		if (eqmb_connected)
+		if (eqmb_connected && memcmp(bd_addr, eqmb_current_remote_addr, sizeof(esp_bd_addr_t)))
 		{
 			esp_ble_gap_disconnect(eqmb_current_remote_addr);
 			esp_ble_remove_bond_device(eqmb_current_remote_addr);
@@ -664,5 +660,7 @@ void app_main(void)
 	gpio_install_isr_service(0);
 	eqmb_pairing_gpio_init();
 	eqmb_ragebtn_gpio_init();
+
+	vTaskDelay(portMAX_DELAY);
 	return;
 }
