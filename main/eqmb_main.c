@@ -74,9 +74,9 @@ static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
 const static uint8_t eqmb_ragebtn_spec_str_len = 4;
 extern const keyboard_cmd_t **eqmb_ragebtn_spec_str[4];
 
-const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_25;	 // ? button for april to rage-press
+const static gpio_num_t eqmb_ragebtn_gpio_num = GPIO_NUM_27;	 // ? button for april to rage-press
 const static gpio_num_t eqmb_pairing_led_gpio_num = GPIO_NUM_26; // led to indicate advertising
-const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_27;	 // button to start pairing
+const static gpio_num_t eqmb_pairing_gpio_num = GPIO_NUM_25;	 // button to start pairing
 
 // sleep
 const static gpio_num_t eqmb_sleep_gpio_num = eqmb_pairing_gpio_num; // use the pairing button for wakeup
