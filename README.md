@@ -9,6 +9,8 @@ This project has an alt-name: the <b>EMERGENCY BUTTON for a certain PROFESSOR'S 
 
 This is an application based on ESP32 microcontroller. It comes with a top Rage-Button, a BT control button, a micro-USB charging port and a power switch.
 
+![Prototype](image/prototype.jpg)
+
 ### Power
 
 This device is powered by a single 16340 lithium battery that can be recharged from micro-USB. There is a power switch on the bottom side of the device.
