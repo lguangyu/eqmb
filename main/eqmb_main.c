@@ -83,7 +83,8 @@ const static gpio_num_t eqmb_sleep_gpio_num = eqmb_pairing_gpio_num; // use the 
 static TimerHandle_t eqmb_sleep_timer = NULL;
 const static int eqmb_sleep_timer_duration = 120000 / portTICK_PERIOD_MS; // 2 minutes = 120,000 ms
 
-#define HIDD_DEVICE_NAME "EQMB"
+// #define HIDD_DEVICE_NAME "EQMB"
+#define HIDD_DEVICE_NAME "EBPR"
 static uint8_t hidd_service_uuid128[] = {
 	0xfb,
 	0x34,
@@ -367,8 +368,8 @@ static void eqmb_ragebtn_send_key(uint8_t act_streak)
 	if ((sstr_word_p == NULL) && (spec_str_due == 0))
 	{
 		spec_str_due = esp_random() & 0x1f;
-		if (spec_str_due < 0x08) // at least 8 presses to trigger special string
-			spec_str_due += 0x08;
+		if (spec_str_due < 0x10) // at least 16 presses before special string
+			spec_str_due += 0x10;
 	}
 	// check if need to send special string
 	if (sstr_word_p == NULL)
