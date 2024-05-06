@@ -65,7 +65,7 @@ static bool eqmb_connected = false; // bool = only one connection
 									// otherwise, should use a counter
 static uint16_t hidd_conn_id;
 static esp_bd_addr_t eqmb_current_remote_addr = {0};
-const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x73, 0x15};
+// const static esp_bd_addr_t eqmb_static_local_addr = {0xd6, 0x3c, 0x1e, 0x0b, 0x73, 0x15};
 
 // the RAGE-BUTTON!!!!! FINALLY
 static QueueHandle_t eqmb_ragebtn_gpio_queue = NULL;
@@ -124,7 +124,7 @@ static esp_ble_adv_params_t hidd_adv_params = {
 	.adv_int_min = 0x20,
 	.adv_int_max = 0x30,
 	.adv_type = ADV_TYPE_IND,
-	.own_addr_type = BLE_ADDR_TYPE_RANDOM,
+	.own_addr_type = BLE_ADDR_TYPE_PUBLIC,
 	.channel_map = ADV_CHNL_ALL,
 	.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST,
 };
@@ -649,7 +649,7 @@ void app_main(void)
 	eqmb_nvs_flash_init();
 	eqmb_bt_controller_init();
 	eqmb_bluedroid_init();
-	ESP_ERROR_CHECK(esp_ble_gap_set_rand_addr((uint8_t *)eqmb_static_local_addr));
+	// ESP_ERROR_CHECK(esp_ble_gap_set_rand_addr((uint8_t *)eqmb_static_local_addr));
 	ESP_ERROR_CHECK(esp_hidd_profile_init());
 	eqmb_load_bond_devices_as_whitelist();
 	// register the callback function to the gap module
